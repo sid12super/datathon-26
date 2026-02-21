@@ -1,0 +1,28 @@
+# Claude Code
+CLAUDE.md
+
+# Virtual environment
+datathon_env/
+
+# Trained model artifacts
+datathon-26/src/track2/model/
+datathon-26/src/model/
+
+# Inference output
+predictions.csv
+val_predictions.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
