@@ -77,19 +77,89 @@ def build_vectorizer(mode: str) -> TfidfVectorizer:
     )
 
 
-def tune_threshold(val_probs: np.ndarray, y_true: np.ndarray) -> tuple[float, float]:
+def tune_threshold_global(val_probs: np.ndarray, y_true: np.ndarray) -> tuple[float, float]:
     """
-    Sweep thresholds to maximize Micro-F1 on validation (active labels only).
-    Returns (best_threshold, best_micro_f1).
+    Sweep a single threshold to maximize Micro-F1 on validation (active labels only).
+    Returns (best_threshold, best_micro_f1).  Used as fallback for labels with no
+    positive val examples.
     """
     best_thr, best_micro = 0.25, -1.0
-    for thr in np.linspace(0.05, 0.60, 56):  # 0.05..0.60 step ~0.01
+    for thr in np.linspace(0.05, 0.90, 86):
         pred = (val_probs >= thr).astype(int)
         micro = f1_score(y_true, pred, average="micro", zero_division=0)
         if micro > best_micro:
             best_micro = micro
             best_thr = float(thr)
     return best_thr, best_micro
+
+
+def tune_thresholds_per_label(
+    val_probs: np.ndarray,
+    y_true: np.ndarray,
+    active_labels: list[str],
+    global_fallback_thr: float,
+) -> tuple[list[float], float]:
+    """
+    EDA showed 2768x class imbalance — a single global threshold is suboptimal.
+    Tune one threshold per label by maximising binary F1 on val independently.
+    Labels with zero positive val examples fall back to the global threshold.
+    Returns (per_label_thresholds, micro_f1_with_per_label_thrs).
+    """
+    sweep = np.linspace(0.05, 0.90, 86)
+    thresholds: list[float] = []
+
+    for i in range(len(active_labels)):
+        n_pos = int(y_true[:, i].sum())
+        if n_pos == 0:
+            # Can't tune — no signal in val for this label
+            thresholds.append(global_fallback_thr)
+            continue
+        best_thr, best_f1 = global_fallback_thr, -1.0
+        for thr in sweep:
+            pred = (val_probs[:, i] >= thr).astype(int)
+            f1 = f1_score(y_true[:, i], pred, average="binary", zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thr = float(thr)
+        thresholds.append(best_thr)
+
+    # Evaluate overall Micro-F1 with the assembled per-label thresholds
+    pred_matrix = np.column_stack([
+        (val_probs[:, i] >= thresholds[i]).astype(int)
+        for i in range(len(active_labels))
+    ])
+    micro = f1_score(y_true, pred_matrix, average="micro", zero_division=0)
+    return thresholds, micro
+
+
+def report_per_label_f1(
+    val_probs: np.ndarray,
+    y_true: np.ndarray,
+    thresholds: list[float],
+    active_labels: list[str],
+    n_show: int = 15,
+) -> None:
+    """Print per-label binary F1 on val — useful for spotting which labels are hard."""
+    rows = []
+    for i, label in enumerate(active_labels):
+        pred = (val_probs[:, i] >= thresholds[i]).astype(int)
+        n_pos = int(y_true[:, i].sum())
+        f1 = f1_score(y_true[:, i], pred, average="binary", zero_division=0)
+        rows.append((label, f1, n_pos, thresholds[i]))
+
+    rows.sort(key=lambda x: x[1])
+    print(f"\n{'─'*65}")
+    print(f"  Per-label val binary F1  (bottom {n_show})")
+    print(f"{'─'*65}")
+    print(f"  {'Label':<22} {'F1':>6}  {'val+':>5}  {'thr':>5}")
+    for label, f1, pos, thr in rows[:n_show]:
+        print(f"  {label:<22} {f1:>6.3f}  {pos:>5}  {thr:>5.2f}")
+    print(f"\n  Per-label val binary F1  (top {n_show})")
+    print(f"{'─'*65}")
+    print(f"  {'Label':<22} {'F1':>6}  {'val+':>5}  {'thr':>5}")
+    for label, f1, pos, thr in rows[-n_show:]:
+        print(f"  {label:<22} {f1:>6.3f}  {pos:>5}  {thr:>5.2f}")
+    print(f"{'─'*65}")
 
 
 def main():
@@ -145,17 +215,32 @@ def main():
         scores = clf.decision_function(X_val)
         val_probs = 1.0 / (1.0 + np.exp(-scores))
 
-    # Tune threshold
-    best_thr, best_micro = tune_threshold(val_probs, Y_val_active)
-    print(f"Best val Micro-F1 (active labels): {best_micro:.4f} @ thr={best_thr:.2f}")
+    # ── Threshold tuning ────────────────────────────────────────────────────
+    # Global threshold (micro-F1 optimal) — used as fallback for labels with
+    # no positive val examples (EDA: ~20 labels appear only once in train).
+    global_thr, global_micro = tune_threshold_global(val_probs, Y_val_active)
+    print(f"Global threshold  → val Micro-F1: {global_micro:.4f} @ thr={global_thr:.2f}")
 
-    # Save artifacts
+    # Per-label thresholds — EDA showed 2768x imbalance, so different labels
+    # naturally sit at very different operating points.
+    per_label_thrs, per_label_micro = tune_thresholds_per_label(
+        val_probs, Y_val_active, active_labels.tolist(), global_thr
+    )
+    print(f"Per-label threshold → val Micro-F1: {per_label_micro:.4f}"
+          f"  (Δ {per_label_micro - global_micro:+.4f} vs global)")
+
+    report_per_label_f1(val_probs, Y_val_active, per_label_thrs, active_labels.tolist())
+
+    # ── Save artifacts ───────────────────────────────────────────────────────
     joblib.dump(vectorizer, os.path.join(MODEL_DIR, "tfidf.joblib"))
     joblib.dump(clf, os.path.join(MODEL_DIR, "ovr_logreg.joblib"))
 
     meta = {
-        "threshold": best_thr,
-        "labels": labels,  # includes "none"
+        # Per-label thresholds (primary — aligned to active_labels order)
+        "thresholds": per_label_thrs,
+        # Global threshold kept for reference / backward compat
+        "threshold": global_thr,
+        "labels": labels,                      # includes "none"
         "active_labels": active_labels.tolist(),  # excludes "none"
         "vectorizer_mode": VECTORIZER_MODE,
         "C": C_VALUE,
@@ -165,8 +250,7 @@ def main():
     with open(os.path.join(MODEL_DIR, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"Saved model artifacts to: {MODEL_DIR}")
-    print("Expected files:")
+    print(f"\nSaved model artifacts to: {MODEL_DIR}")
     print(" - model/tfidf.joblib")
     print(" - model/ovr_logreg.joblib")
     print(" - model/meta.json")

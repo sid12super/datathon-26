@@ -21,9 +21,9 @@ from sklearn.metrics import f1_score, accuracy_score, hamming_loss
 # CHANGE THESE PATHS IF NEEDED
 # ==============================================================================
 
-INPUT_PATH  = "test.csv"
+INPUT_PATH  = "val.csv"
 OUTPUT_PATH = "predictions.csv"
-LABELS_PATH = None             # set to "val.csv" for self-evaluation only
+LABELS_PATH = "val.csv"            # set to "val.csv" for self-evaluation only
 MODEL_PATH  = "model/"
 
 # ==============================================================================
@@ -34,6 +34,7 @@ def load_model():
     import os
     import json
     import joblib
+    import numpy as np
 
     vec_path = os.path.join(MODEL_PATH, "tfidf.joblib")
     clf_path = os.path.join(MODEL_PATH, "ovr_logreg.joblib")
@@ -45,36 +46,40 @@ def load_model():
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
+    active_labels = meta["active_labels"]
+
+    # Prefer per-label thresholds (written by updated train.py);
+    # fall back to the single global threshold for older model artifacts.
+    if "thresholds" in meta:
+        thresholds = np.array(meta["thresholds"], dtype=float)
+    else:
+        thresholds = np.full(len(active_labels), float(meta["threshold"]))
+
     return {
         "vectorizer": vectorizer,
         "clf": clf,
-        "threshold": float(meta["threshold"]),
-        "active_labels": meta["active_labels"],  # excludes "none"
+        "thresholds": thresholds,          # shape: (n_active_labels,)
+        "active_labels": active_labels,    # excludes "none"
     }
-
 
 
 def predict(model, texts: list[str]) -> list[str]:
     import numpy as np
 
-    vectorizer = model["vectorizer"]
-    clf = model["clf"]
-    thr = model["threshold"]
+    vectorizer  = model["vectorizer"]
+    clf         = model["clf"]
+    thresholds  = model["thresholds"]   # per-label array
     active_labels = model["active_labels"]
 
     X = vectorizer.transform([t if isinstance(t, str) else "" for t in texts])
 
-    # For OVR LogisticRegression, predict_proba exists
-    probs = clf.predict_proba(X)  # shape: (n_samples, n_active_labels)
-    preds = (probs >= thr).astype(int)
+    probs = clf.predict_proba(X)           # (n_samples, n_active_labels)
+    preds = (probs >= thresholds).astype(int)   # broadcast row-wise
 
     out = []
     for row in preds:
         labels = [active_labels[j] for j, v in enumerate(row) if v == 1]
-        if not labels:
-            out.append("none")
-        else:
-            out.append("|".join(labels))
+        out.append("|".join(labels) if labels else "none")
     return out
 
 # ==============================================================================
