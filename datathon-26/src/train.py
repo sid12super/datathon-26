@@ -11,8 +11,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
 
 MODEL_DIR = "model/"
-TRAIN_PATH = "train.csv"
-VAL_PATH = "val.csv"
+TRAIN_PATH = "/workspaces/datathon-26/datathon-26/src/track2/train.csv"
+VAL_PATH = "/workspaces/datathon-26/datathon-26/src/track2/val.csv"
 LABEL_LIST_PATH = "label_list.txt"
 
 def parse_topics(x: str):
