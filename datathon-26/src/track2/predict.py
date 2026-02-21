@@ -31,43 +31,51 @@ MODEL_PATH  = "model/"
 # ==============================================================================
 
 def load_model():
-    """
-    Load and return your trained model from MODEL_PATH.
+    import os
+    import json
+    import joblib
 
-    Example (PyTorch / embedding model):
-        import torch
-        model = MyModel()
-        model.load_state_dict(torch.load(MODEL_PATH + "weights.pt", map_location="cpu"))
-        model.eval()
-        return model
+    vec_path = os.path.join(MODEL_PATH, "tfidf.joblib")
+    clf_path = os.path.join(MODEL_PATH, "ovr_logreg.joblib")
+    meta_path = os.path.join(MODEL_PATH, "meta.json")
 
-    Example (scikit-learn):
-        import joblib
-        return joblib.load(MODEL_PATH + "classifier.pkl")
-    """
-    raise NotImplementedError("Implement load_model()")
+    vectorizer = joblib.load(vec_path)
+    clf = joblib.load(clf_path)
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    return {
+        "vectorizer": vectorizer,
+        "clf": clf,
+        "threshold": float(meta["threshold"]),
+        "active_labels": meta["active_labels"],  # excludes "none"
+    }
+
 
 
 def predict(model, texts: list[str]) -> list[str]:
-    """
-    Run inference on a list of article texts.
+    import numpy as np
 
-    Args:
-        model  : whatever load_model() returns
-        texts  : list of raw article text strings
+    vectorizer = model["vectorizer"]
+    clf = model["clf"]
+    thr = model["threshold"]
+    active_labels = model["active_labels"]
 
-    Returns:
-        A list of pipe-separated topic strings, one per article.
-        e.g. ["earn", "money-fx|trade", "none", "earn|trade|grain"]
+    X = vectorizer.transform([t if isinstance(t, str) else "" for t in texts])
 
-    Rules:
-        - Return exactly len(texts) predictions
-        - Multiple labels separated by pipe: "earn|trade"
-        - Articles with no predicted label must return "none"
-        - Use only labels from label_list.txt
-        - Label order does not matter
-    """
-    raise NotImplementedError("Implement predict()")
+    # For OVR LogisticRegression, predict_proba exists
+    probs = clf.predict_proba(X)  # shape: (n_samples, n_active_labels)
+    preds = (probs >= thr).astype(int)
+
+    out = []
+    for row in preds:
+        labels = [active_labels[j] for j, v in enumerate(row) if v == 1]
+        if not labels:
+            out.append("none")
+        else:
+            out.append("|".join(labels))
+    return out
 
 # ==============================================================================
 # DO NOT MODIFY ANYTHING BELOW THIS LINE
