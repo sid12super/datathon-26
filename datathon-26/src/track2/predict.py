@@ -21,9 +21,9 @@ from sklearn.metrics import f1_score, accuracy_score, hamming_loss
 # CHANGE THESE PATHS IF NEEDED
 # ==============================================================================
 
-INPUT_PATH  = "val.csv"
+INPUT_PATH  = "test.csv"
 OUTPUT_PATH = "predictions.csv"
-LABELS_PATH = "val.csv"            # set to None for final submission
+LABELS_PATH = None
 MODEL_PATH  = "model/"
 
 # ==============================================================================
