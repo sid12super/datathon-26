@@ -36,45 +36,63 @@ def load_model():
     import joblib
     import numpy as np
 
-    vec_path = os.path.join(MODEL_PATH, "tfidf.joblib")
-    clf_path = os.path.join(MODEL_PATH, "ovr_logreg.joblib")
+    vec_path  = os.path.join(MODEL_PATH, "tfidf.joblib")
+    lr_path   = os.path.join(MODEL_PATH, "ovr_logreg.joblib")
+    svc_path  = os.path.join(MODEL_PATH, "ovr_svc.joblib")
     meta_path = os.path.join(MODEL_PATH, "meta.json")
 
     vectorizer = joblib.load(vec_path)
-    clf = joblib.load(clf_path)
+    lr_clf     = joblib.load(lr_path)
+
+    # Load SVC only if the artifact was produced by the ensemble trainer
+    svc_clf = joblib.load(svc_path) if os.path.exists(svc_path) else None
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
     active_labels = meta["active_labels"]
-
-    # Prefer per-label thresholds (written by updated train.py);
-    # fall back to the single global threshold for older model artifacts.
-    if "thresholds" in meta:
-        thresholds = np.array(meta["thresholds"], dtype=float)
-    else:
-        thresholds = np.full(len(active_labels), float(meta["threshold"]))
+    threshold     = float(meta["threshold"])        # global ensemble threshold
+    use_ensemble  = meta.get("use_ensemble", False) and svc_clf is not None
+    lr_weight     = float(meta.get("lr_weight", 0.5))
+    svc_weight    = float(meta.get("svc_weight", 0.5))
 
     return {
-        "vectorizer": vectorizer,
-        "clf": clf,
-        "thresholds": thresholds,          # shape: (n_active_labels,)
-        "active_labels": active_labels,    # excludes "none"
+        "vectorizer":   vectorizer,
+        "lr_clf":       lr_clf,
+        "svc_clf":      svc_clf,
+        "threshold":    threshold,       # single global threshold
+        "active_labels": active_labels,
+        "use_ensemble": use_ensemble,
+        "lr_weight":    lr_weight,
+        "svc_weight":   svc_weight,
     }
 
 
 def predict(model, texts: list[str]) -> list[str]:
     import numpy as np
 
-    vectorizer  = model["vectorizer"]
-    clf         = model["clf"]
-    thresholds  = model["thresholds"]   # per-label array
+    vectorizer    = model["vectorizer"]
+    lr_clf        = model["lr_clf"]
+    svc_clf       = model["svc_clf"]
+    threshold     = model["threshold"]
     active_labels = model["active_labels"]
+    use_ensemble  = model["use_ensemble"]
+    lr_weight     = model["lr_weight"]
+    svc_weight    = model["svc_weight"]
 
-    X = vectorizer.transform([t if isinstance(t, str) else "" for t in texts])
+    clean = [t if isinstance(t, str) else "" for t in texts]
+    X = vectorizer.transform(clean)
 
-    probs = clf.predict_proba(X)           # (n_samples, n_active_labels)
-    preds = (probs >= thresholds).astype(int)   # broadcast row-wise
+    lr_probs = lr_clf.predict_proba(X)          # (n_samples, n_active_labels)
+
+    if use_ensemble:
+        svc_scores = svc_clf.decision_function(X)
+        svc_probs  = 1.0 / (1.0 + np.exp(-np.clip(svc_scores, -50, 50)))
+        probs = lr_weight * lr_probs + svc_weight * svc_probs
+    else:
+        probs = lr_probs
+
+    preds = (probs >= threshold).astype(int)
 
     out = []
     for row in preds:
