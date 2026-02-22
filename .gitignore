@@ -8,6 +8,9 @@ datathon_env/
 datathon-26/src/track2/model/
 datathon-26/src/model/
 
+# Large data files (GloVe, model zips)
+datathon-26/src/track2/data/
+
 # Inference output
 predictions.csv
 val_predictions.csv

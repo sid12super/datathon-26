@@ -1,16 +1,16 @@
 """
-Track 2 – predict.py
-=====================
-Implement load_model() and predict() only.
-DO NOT modify anything below the marked line.
-
+Track 2 – predict.py  (BiLSTM + TF-IDF ensemble, Category 1)
+=============================================================
 Self-evaluate on val set:
     INPUT_PATH  = "val.csv"
     LABELS_PATH = "val.csv"
 
-Final submission (paths must be set to test before submitting):
+Final submission (set before zipping):
     INPUT_PATH  = "test.csv"
     LABELS_PATH = None
+
+Before running inference, ensure model/meta_ensemble.json exists:
+    python tune_ensemble.py   ← run once after training
 """
 
 import pandas as pd
@@ -23,82 +23,206 @@ from sklearn.metrics import f1_score, accuracy_score, hamming_loss
 
 INPUT_PATH  = "val.csv"
 OUTPUT_PATH = "predictions.csv"
-LABELS_PATH = "val.csv"            # set to "val.csv" for self-evaluation only
+LABELS_PATH = "val.csv"            # set to None for final submission
 MODEL_PATH  = "model/"
 
 # ==============================================================================
 # YOUR CODE — IMPLEMENT THESE TWO FUNCTIONS
 # ==============================================================================
 
-def load_model():
-    import os
-    import json
-    import joblib
-    import numpy as np
+import os
+import json
+import pickle
 
-    vec_path  = os.path.join(MODEL_PATH, "tfidf.joblib")
-    lr_path   = os.path.join(MODEL_PATH, "ovr_logreg.joblib")
-    svc_path  = os.path.join(MODEL_PATH, "ovr_svc.joblib")
-    meta_path = os.path.join(MODEL_PATH, "meta.json")
+import numpy as np
+import torch
+import torch.nn as nn
+import joblib
 
-    vectorizer = joblib.load(vec_path)
-    lr_clf     = joblib.load(lr_path)
 
-    # Load SVC only if the artifact was produced by the ensemble trainer
-    svc_clf = joblib.load(svc_path) if os.path.exists(svc_path) else None
+# ── Sigmoid helper ─────────────────────────────────────────────────────────────
 
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
 
-    active_labels = meta["active_labels"]
-    threshold     = float(meta["threshold"])        # global ensemble threshold
-    use_ensemble  = meta.get("use_ensemble", False) and svc_clf is not None
-    lr_weight     = float(meta.get("lr_weight", 0.5))
-    svc_weight    = float(meta.get("svc_weight", 0.5))
+
+# ── BiLSTM model definition (must match bilstm_train.py exactly) ───────────────
+
+class BiLSTMClassifier(nn.Module):
+    """2-layer BiLSTM with masked mean-pooling. Matches bilstm_train.py."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim:  int,
+        hidden_dim: int,
+        num_layers: int,
+        num_labels: int,
+        dropout:    float = 0.0,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(
+            embed_dim,
+            hidden_dim,
+            num_layers    = num_layers,
+            bidirectional = True,
+            batch_first   = True,
+            dropout       = dropout if num_layers > 1 else 0.0,
+        )
+        self.dropout    = nn.Dropout(dropout)
+        self.fc         = nn.Linear(hidden_dim * 2, num_labels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mask    = (x != 0).float()
+        lengths = mask.sum(dim=1, keepdim=True).clamp(min=1)
+        emb         = self.dropout(self.embedding(x))
+        out, _      = self.lstm(emb)
+        pooled = (out * mask.unsqueeze(-1)).sum(dim=1) / lengths
+        pooled = self.dropout(pooled)
+        return self.fc(pooled)
+
+
+# ── Tokenisation (identical to bilstm_train.py) ────────────────────────────────
+
+def _tokenize_batch(texts: list, vocab: dict, max_len: int) -> torch.Tensor:
+    UNK = vocab.get("<UNK>", 1)
+    seqs = []
+    for t in texts:
+        tokens = t.lower().split()[:max_len]
+        ids    = [vocab.get(tok, UNK) for tok in tokens]
+        ids   += [0] * (max_len - len(ids))
+        seqs.append(ids)
+    return torch.tensor(seqs, dtype=torch.long)
+
+
+# ── load_model ─────────────────────────────────────────────────────────────────
+
+def load_model() -> dict:
+    # ── BiLSTM ────────────────────────────────────────────────────────────────
+    with open(os.path.join(MODEL_PATH, "vocab.pkl"), "rb") as f:
+        vocab = pickle.load(f)
+    with open(os.path.join(MODEL_PATH, "meta_bilstm.json"), "r") as f:
+        meta_b = json.load(f)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = BiLSTMClassifier(
+        vocab_size = meta_b["vocab_size"],
+        embed_dim  = meta_b["embed_dim"],
+        hidden_dim = meta_b["hidden_dim"],
+        num_layers = meta_b["num_layers"],
+        num_labels = meta_b["num_labels"],
+        dropout    = meta_b.get("dropout", 0.3),
+    ).to(device)
+    state = torch.load(
+        os.path.join(MODEL_PATH, "bilstm.pt"),
+        map_location=device, weights_only=True,
+    )
+    net.load_state_dict(state)
+    net.eval()
+
+    # ── TF-IDF ensemble ───────────────────────────────────────────────────────
+    vectorizer = joblib.load(os.path.join(MODEL_PATH, "tfidf.joblib"))
+    lr_clf     = joblib.load(os.path.join(MODEL_PATH, "ovr_logreg.joblib"))
+    svc_clf    = joblib.load(os.path.join(MODEL_PATH, "ovr_svc.joblib"))
+
+    # ── Ensemble meta (threshold + alpha) ─────────────────────────────────────
+    meta_ens_path = os.path.join(MODEL_PATH, "meta_ensemble.json")
+    if not os.path.exists(meta_ens_path):
+        raise FileNotFoundError(
+            f"{meta_ens_path} not found. Run `python tune_ensemble.py` first."
+        )
+    with open(meta_ens_path) as f:
+        meta_ens = json.load(f)
+
+    active_labels  = meta_ens["active_labels"]    # 115 labels (no "none")
+    bilstm_alpha   = float(meta_ens["bilstm_alpha"])
+    threshold      = float(meta_ens["threshold"])
+    bilstm_classes = meta_b["labels"]             # 116 labels (from meta_bilstm.json)
+    b_idx = [bilstm_classes.index(l) for l in active_labels]  # alignment
+
+    print(
+        f"Ensemble loaded  →  bilstm_alpha={bilstm_alpha}  "
+        f"thr={threshold:.2f}  val_f1={meta_ens['val_micro_f1']}  device={device}"
+    )
 
     return {
-        "vectorizer":   vectorizer,
-        "lr_clf":       lr_clf,
-        "svc_clf":      svc_clf,
-        "threshold":    threshold,       # single global threshold
+        # BiLSTM
+        "net":           net,
+        "vocab":         vocab,
+        "max_len":       int(meta_b["max_len"]),
+        "device":        device,
+        "b_idx":         b_idx,
+        # TF-IDF
+        "vectorizer":    vectorizer,
+        "lr_clf":        lr_clf,
+        "svc_clf":       svc_clf,
+        # Ensemble
         "active_labels": active_labels,
-        "use_ensemble": use_ensemble,
-        "lr_weight":    lr_weight,
-        "svc_weight":   svc_weight,
+        "bilstm_alpha":  bilstm_alpha,
+        "threshold":     threshold,
     }
 
 
-def predict(model, texts: list[str]) -> list[str]:
-    import numpy as np
+# ── predict ────────────────────────────────────────────────────────────────────
 
-    vectorizer    = model["vectorizer"]
-    lr_clf        = model["lr_clf"]
-    svc_clf       = model["svc_clf"]
-    threshold     = model["threshold"]
+def predict(model: dict, texts: list) -> list:
+    """
+    texts  — list of body strings passed by the harness.
+    We re-read INPUT_PATH to combine title+body (matching training setup).
+    Falls back to body-only if reading fails.
+    """
+    # Combine title + body to reproduce the exact text seen during training
+    combined = texts
+    try:
+        df_full = pd.read_csv(INPUT_PATH, dtype=str).fillna("")
+        if "title" in df_full.columns and len(df_full) == len(texts):
+            combined = (df_full["title"] + ". " + df_full["text"]).tolist()
+    except Exception:
+        pass  # silently fall back to body-only
+
+    net          = model["net"]
+    vocab        = model["vocab"]
+    max_len      = model["max_len"]
+    device       = model["device"]
+    b_idx        = model["b_idx"]
+    vectorizer   = model["vectorizer"]
+    lr_clf       = model["lr_clf"]
+    svc_clf      = model["svc_clf"]
     active_labels = model["active_labels"]
-    use_ensemble  = model["use_ensemble"]
-    lr_weight     = model["lr_weight"]
-    svc_weight    = model["svc_weight"]
+    bilstm_alpha  = model["bilstm_alpha"]
+    threshold     = model["threshold"]
 
-    clean = [t if isinstance(t, str) else "" for t in texts]
-    X = vectorizer.transform(clean)
+    # ── BiLSTM probs (N, 116) → slice to 115 active labels ───────────────────
+    INFER_BATCH = 256
+    all_probs: list = []
+    with torch.no_grad():
+        for i in range(0, len(combined), INFER_BATCH):
+            batch  = combined[i : i + INFER_BATCH]
+            X      = _tokenize_batch(batch, vocab, max_len).to(device)
+            logits = net(X)
+            probs  = torch.sigmoid(logits).cpu().numpy()
+            all_probs.append(probs)
+    B_full = np.vstack(all_probs)          # (N, 116)
+    B      = B_full[:, b_idx]              # (N, 115)
 
-    lr_probs = lr_clf.predict_proba(X)          # (n_samples, n_active_labels)
+    # ── TF-IDF probs (N, 115) ─────────────────────────────────────────────────
+    X_tfidf   = vectorizer.transform(combined)
+    lr_probs  = lr_clf.predict_proba(X_tfidf)              # (N, 115)
+    svc_probs = _sigmoid(svc_clf.decision_function(X_tfidf))  # (N, 115)
+    T         = 0.5 * lr_probs + 0.5 * svc_probs           # (N, 115)
 
-    if use_ensemble:
-        svc_scores = svc_clf.decision_function(X)
-        svc_probs  = 1.0 / (1.0 + np.exp(-np.clip(svc_scores, -50, 50)))
-        probs = lr_weight * lr_probs + svc_weight * svc_probs
-    else:
-        probs = lr_probs
+    # ── Ensemble + threshold ──────────────────────────────────────────────────
+    ens_probs = bilstm_alpha * B + (1.0 - bilstm_alpha) * T
+    preds_bin = (ens_probs >= threshold).astype(int)
 
-    preds = (probs >= threshold).astype(int)
+    out: list = []
+    for row in preds_bin:
+        label_list = [active_labels[j] for j, v in enumerate(row) if v == 1]
+        out.append("|".join(label_list) if label_list else "none")
 
-    out = []
-    for row in preds:
-        labels = [active_labels[j] for j, v in enumerate(row) if v == 1]
-        out.append("|".join(labels) if labels else "none")
     return out
+
 
 # ==============================================================================
 # DO NOT MODIFY ANYTHING BELOW THIS LINE
